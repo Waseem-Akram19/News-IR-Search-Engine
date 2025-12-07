@@ -1,0 +1,15 @@
+numpy
+pandas
+scikit-learn
+scipy
+nltk
+gensim
+sentence-transformers
+rank-bm25
+pyldavis
+streamlit
+tqdm
+pinecone-client
+joblib
+matplotlib
+faiss-cpu
