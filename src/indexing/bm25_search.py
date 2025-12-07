@@ -68,3 +68,9 @@ def search_bm25(query: str, top_k: int = 10):
 
     idx = np.argsort(scores)[::-1][:top_k]
     return [(filenames[i], float(scores[i])) for i in idx]
+
+if __name__ == "__main__":
+    import sys
+    if len(sys.argv) > 1 and sys.argv[1] == "build":
+        build_bm25()
+        print("BM25 build completed.")
