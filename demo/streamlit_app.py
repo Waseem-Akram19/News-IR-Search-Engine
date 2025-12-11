@@ -1,240 +1,532 @@
-#############################################################
-#   STREAMLIT APP WITH SEARCH ENGINE + EVALUATION DASHBOARD  #
-#############################################################
-
+# demo/streamlit_app.py
 import sys
 from pathlib import Path
 import re
-import csv
 import json
 import pickle
 import numpy as np
 import streamlit as st
 import streamlit.components.v1 as components
 
-# Add project root so "src" imports work
+# Add project root to path so "src" imports work when Streamlit runs inside demo/
 ROOT_DIR = Path(__file__).resolve().parents[1]
 sys.path.append(str(ROOT_DIR))
 
-# ---- Project Imports ----
+# --- Imports from your package (cached loaders used below) ---
 from src.preprocessing.clean_text import clean_text
 from src.indexing.search_tfidf import load_tfidf, search_tfidf
-from src.indexing.bm25_search import load_or_build_bm25, search_bm25
+from src.indexing.bm25_search import build_bm25, load_or_build_bm25, search_bm25
 from src.semantic.faiss_index import load_faiss, search_faiss
-from src.topic_modeling.lda_inference import load_lda
-from src.evaluation.evaluate_system import load_qrels
-from src.evaluation.metrics import (
-    precision_at_k, recall_at_k, mean_average_precision, ndcg_at_k
-)
+from src.topic_modeling.lda_inference import load_lda, doc_topic_vector
 
-# ---- Paths ----
+# --- Paths ---
 DATA_PROCESSED = ROOT_DIR / "data" / "processed"
+EMB_DIR = ROOT_DIR / "data" / "embeddings"
 LDA_DIR = ROOT_DIR / "data" / "lda"
+TFIDF_DIR = ROOT_DIR / "data" / "tfidf"
 
-#############################################################
-#                         CACHES
-#############################################################
+# ---------- Helpers and cached loaders ----------
 
 @st.cache_resource
 def cached_load_tfidf():
     try:
-        return load_tfidf()
-    except:
+        vectorizer, tfidf_matrix, filenames = load_tfidf()
+        return vectorizer, tfidf_matrix, filenames
+    except Exception as e:
+        st.warning("TF-IDF artifacts not found in data/tfidf. Run TF-IDF build.")
         return None, None, None
 
 @st.cache_resource
 def cached_load_bm25():
+    """
+    Attempt to load BM25 if saved; if not, build from processed files.
+    We assume build_bm25() creates necessary files in data/tfidf.
+    """
     try:
-        return load_or_build_bm25()
-    except:
-        return None
+        # We provided a helper build_or_load in earlier code; if not, call build_bm25
+        bm25_obj = load_or_build_bm25()
+        return bm25_obj
+    except Exception:
+        try:
+            build_bm25()
+            bm25_obj = load_or_build_bm25()
+            return bm25_obj
+        except Exception as e:
+            st.warning("BM25 is not available and could not be built.")
+            return None
 
 @st.cache_resource
 def cached_load_faiss():
     try:
-        return load_faiss()
-    except:
+        idx, filenames = load_faiss()
+        return idx, filenames
+    except Exception:
+        st.warning("FAISS index not found. Build embeddings & FAISS first.")
         return None, None
 
 @st.cache_resource
 def cached_load_lda():
     try:
-        return load_lda()
-    except:
+        lda, dictionary, filenames = load_lda()
+        return lda, dictionary, filenames
+    except Exception:
+        # LDA not built
         return None, None, None
 
-#############################################################
-#                   THEME HANDLING (DARK/LIGHT)
-#############################################################
+@st.cache_data
+def load_metadata():
+    meta_path = DATA_PROCESSED / "metadata.csv"
+    if not meta_path.exists():
+        return {}
+    import csv
+    md = {}
+    with meta_path.open("r", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            md[row["filename"]] = {"doc_id": row["doc_id"], "category": row["category"], "source_path": row["source_path"]}
+    return md
+
+# ------------ Category → Emoji Mapping ------------
+CATEGORY_ICONS = {
+    "business": "💼 business",
+    "politics": "🏛 politics",
+    "sport": "⚽ sport",
+    "entertainment": "🎬 entertainment",
+    "tech": "💻 tech",
+    "unknown": "📄 unknown"
+}
+
+def category_with_icon(cat: str):
+    cat = cat.lower().strip()
+    return CATEGORY_ICONS.get(cat, CATEGORY_ICONS["unknown"])
+
+
+def highlight_query_terms(text, query, max_len=500):
+    """Highlight tokens from the cleaned query in the original text.
+       We'll match on word boundaries, case-insensitive."""
+    if not query:
+        return text[:max_len] + ("..." if len(text) > max_len else "")
+    # take cleaned tokens (space-separated)
+    cleaned_q = clean_text(query)
+    tokens = list(dict.fromkeys([t for t in cleaned_q.split() if len(t) > 1]))  # preserve order, unique
+    if not tokens:
+        return text[:max_len] + ("..." if len(text) > max_len else "")
+    # highlight each token (escape tokens)
+    def repl(m):
+        return f"<mark>{m.group(0)}</mark>"
+    pattern = r"\b(" + "|".join(re.escape(t) for t in tokens) + r")\b"
+    try:
+        highlighted = re.sub(pattern, repl, text, flags=re.IGNORECASE)
+        if len(highlighted) > max_len:
+            # try to return first part but include highlights around first occurrences
+            return highlighted[:max_len] + "..."
+        return highlighted
+    except re.error:
+        return text[:max_len] + ("..." if len(text) > max_len else "")
+
+def tfidf_top_keywords_for_doc(vectorizer, tfidf_matrix, filenames, fname, top_n=10):
+    """Return top tf-idf feature names and their scores for a given processed filename."""
+    try:
+        if vectorizer is None or tfidf_matrix is None:
+            return []
+        idx = filenames.index(fname)
+        # tfidf_matrix is sparse
+        vec = tfidf_matrix[idx].toarray().ravel()
+        top_idx = np.argsort(vec)[::-1][:top_n]
+        feature_names = vectorizer.get_feature_names_out()
+        return [(feature_names[i], float(vec[i])) for i in top_idx if vec[i] > 0]
+    except Exception:
+        return []
+
+def cosine_sim_query_doc(vectorizer, tfidf_matrix, filenames, query_clean, fname):
+    """Compute cosine similarity between query and a document using TF-IDF vectors."""
+    try:
+        qv = vectorizer.transform([query_clean])
+        idx = filenames.index(fname)
+        dv = tfidf_matrix[idx]
+        from sklearn.metrics.pairwise import cosine_similarity
+        sim = cosine_similarity(qv, dv)[0,0]
+        return float(sim)
+    except Exception:
+        return None
+
+def load_doc_text(fname):
+    p = DATA_PROCESSED / fname
+    if not p.exists():
+        return "(Document not found)"
+    return p.read_text(encoding="utf-8")
+
+# ---------- UI layout ----------
+
+st.set_page_config(page_title="News IR Search Engine (Enhanced)", layout="wide")
+st.title("📚 News IR Search Engine — (TF-IDF | BM25 | Semantic)")
+
+# Sidebar with explanations & controls
+with st.sidebar:
+    st.header("About this Project")
+    st.write("End-to-end News IR system built for CS516 course project.")
+    st.markdown("- **TF-IDF**: lexical cosine similarity (vector space).")
+    st.markdown("- **BM25**: probabilistic ranking (document length normalization).")
+    st.markdown("- **Semantic (FAISS)**: transformer embeddings + ANN (semantic similarity).")
+    st.markdown("- **LDA**: topic modeling for topic distribution per doc.")
+    st.markdown("---")
+    # --- Evaluation Button ---
+    run_eval = st.button("📊 Run Evaluation")
+
+
+    st.subheader("Options")
+    show_full_text = st.checkbox("Show full document text", value=False)
+    enable_highlighting = st.checkbox("Highlight query terms in preview", value=True)
+    show_topic_viz = st.checkbox("Show LDA topics (pyLDAvis)", value=False)
+    dark_mode = st.checkbox("🌙 Dark Mode", value=False)
+    st.markdown("---")
+    st.write("Data path: `data/processed`")
+    st.write("Docs processed:", len(list((ROOT_DIR/"data"/"processed").glob("*.txt"))))
 
 def apply_theme(dark: bool):
     if dark:
+        # ---------------------- DARK MODE ----------------------
         css = """
         <style>
-        .stApp { background:#0e1117; color:#e6e6e6; }
-        section[data-testid="stSidebar"] { background:#161b22 !important; }
-        .stMarkdown, p, span, li { color:#e8e8e8 !important; }
-        div[data-baseweb="input"] > input { background:#1c2128; color:#e6e6e6 !important; }
-        div[role="tab"] { background:#1c2128; color:#e6e6e6 !important; }
-        div[role="tab"][aria-selected="true"] { background:#238636 !important; color:white !important; }
-        mark { background:#f39c12 !important; color:black; padding:2px 4px; border-radius:4px; }
+        .stApp {
+            background-color: #0e1117 !important;
+            color: #e6e6e6 !important;
+        }
+        section[data-testid="stSidebar"] {
+            background-color: #161b22 !important;
+            color: #e6e6e6 !important;
+        }
+        /* Inputs */
+        div[data-baseweb="input"] > input {
+            background-color: #1c2128 !important;
+            color: #e6e6e6 !important;
+        }
+        .stSelectbox div, .stSlider, .stMultiSelect {
+            color: #e6e6e6 !important;
+        }
+        /* Tabs */
+        div[data-baseweb="tab-list"] {
+            background-color: #161b22 !important;
+        }
+        div[role="tab"] {
+            background-color: #1c2128 !important;
+            color: #e6e6e6 !important;
+        }
+        div[role="tab"][aria-selected="true"] {
+            background-color: #238636 !important;
+            color: white !important;
+            font-weight: bold;
+        }
+        /* Expanders */
+        .streamlit-expanderHeader {
+            background-color: #1c2128 !important;
+            color: #f1f1f1 !important;
+        }
+        /* Markdown text */
+        .stMarkdown, p, span, li {
+            color: #e8e8e8 !important;
+        }
+        /* Highlighted query terms */
+        mark {
+            background-color: #f39c12 !important;
+            color: black !important;
+            padding: 2px 4px;
+            border-radius: 4px;
+        }
+        /* Headers */
+        h1, h2, h3, h4 {
+            color: #f0f0f0 !important;
+        }
         </style>
         """
     else:
+        # ---------------------- LIGHT MODE ----------------------
         css = """
         <style>
-        .stApp { background:white; color:#1f1f1f; }
-        section[data-testid="stSidebar"] { background:#f5f5f5; }
-        div[data-baseweb="input"] > input { background:white; color:black !important; }
-        div[role="tab"][aria-selected="true"] { background:#4b8df8 !important; color:white !important; }
-        mark { background:#ffec99 !important; color:black; }
+        .stApp {
+            background-color: #ffffff !important;
+            color: #1f1f1f !important;
+        }
+        section[data-testid="stSidebar"] {
+            background-color: #f5f5f5 !important;
+            color: #1f1f1f !important;
+        }
+        /* Inputs */
+        div[data-baseweb="input"] > input {
+            background-color: #ffffff !important;
+            color: #1f1f1f !important;
+        }
+        /* Tabs */
+        div[data-baseweb="tab-list"] {
+            background-color: #efefef !important;
+        }
+        div[role="tab"] {
+            background-color: #eaeaea !important;
+            color: #1f1f1f !important;
+        }
+        div[role="tab"][aria-selected="true"] {
+            background-color: #4b8df8 !important;
+            color: white !important;
+            font-weight: bold;
+        }
+        /* Expanders */
+        .streamlit-expanderHeader {
+            background-color: #ededed !important;
+            color: #1f1f1f !important;
+        }
+        /* Document text */
+        .stMarkdown, p, span, li {
+            color: #1f1f1f !important;
+        }
+        /* Highlighted query terms */
+        mark {
+            background-color: #ffec99 !important;
+            color: black !important;
+            padding: 2px 4px;
+            border-radius: 4px;
+        }
+        /* Headers */
+        h1, h2, h3, h4 {
+            color: #1f1f1f !important;
+        }
         </style>
         """
     st.markdown(css, unsafe_allow_html=True)
+apply_theme(dark_mode)
+# Top input area
+col1, col2 = st.columns([4,1])
+with col1:
+    query = st.text_input("🔎 Enter search query:", value="", placeholder="e.g. economy inflation government crisis")
+
+with col2:
+    model_choice = st.selectbox("Model:", ["TF-IDF", "BM25", "Semantic"])
+    top_k = st.slider("Top K", min_value=3, max_value=20, value=5)
+
+# Load cached resources
+vectorizer, tfidf_matrix, tfidf_filenames = cached_load_tfidf()
+bm25_obj = cached_load_bm25()
+faiss_index, faiss_filenames = cached_load_faiss()
+lda_model, lda_dictionary, lda_filenames = cached_load_lda()
+metadata = load_metadata()
+
+# Main action
+if st.button("Search"):
+
+    if not query.strip():
+        st.warning("Please enter a query.")
+        st.stop()
+
+    cleaned_query = clean_text(query)
+
+    # run each retrieval model as needed and present results side-by-side in tabs
+    tab_tf, tab_bm, tab_sem = st.tabs(["TF-IDF", "BM25", "Semantic"])
+
+    # --- TF-IDF tab ---
+    with tab_tf:
+        st.subheader("TF-IDF Results")
+        if vectorizer is None:
+            st.error("TF-IDF artifacts not found. Build TF-IDF first.")
+        else:
+            try:
+                tf_results = search_tfidf(cleaned_query, top_k=top_k, vectorizer=vectorizer, tfidf_matrix=tfidf_matrix, filenames=tfidf_filenames)
+            except Exception:
+                tf_results = search_tfidf(cleaned_query, top_k=top_k)
+
+            for rank, (fname, score) in enumerate(tf_results, start=1):
+                st.markdown(f"### {rank}. {fname} — score: {score:.4f}")
+                text = load_doc_text(fname)
+                # highlight if enabled
+                display_text = highlight_query_terms(text, query, max_len=1500) if enable_highlighting else (text[:1500] + ("..." if len(text)>1500 else ""))
+                st.markdown(display_text, unsafe_allow_html=True)
+
+                # metadata panel
+                with st.expander("Document metadata & analysis"):
+                    # category
+                    cat = metadata.get(fname, {}).get("category", "unknown")
+                    st.write(f"**Category:** {category_with_icon(cat)}")
+
+                    # TF-IDF top keywords
+                    kw = tfidf_top_keywords_for_doc(vectorizer, tfidf_matrix, tfidf_filenames, fname, top_n=10)
+                    if kw:
+                        st.write("**Top TF-IDF terms (this doc):**")
+                        st.write(", ".join(f"{t} ({s:.3f})" for t,s in kw))
+                    # cosine similarity (tfidf)
+                    sim = cosine_sim_query_doc(vectorizer, tfidf_matrix, tfidf_filenames, cleaned_query, fname)
+                    if sim is not None:
+                        st.write(f"**Cosine (query vs doc)**: {sim:.4f}")
+                    # LDA topic dist
+                    if lda_model is not None:
+                        # tokens of doc
+                        doc_toks = load_doc_text(fname).split()
+                        try:
+                            bow = lda_dictionary.doc2bow(doc_toks)
+                            td = lda_model.get_document_topics(bow)
+                            top_topics = sorted(td, key=lambda x: x[1], reverse=True)[:5]
+                            st.write("**Top topics (LDA)**:")
+                            for tid, prob in top_topics:
+                                st.write(f"Topic {tid} — {prob:.3f}")
+                        except Exception:
+                            st.write("LDA topic info not available for this doc.")
+                st.markdown("---")
+
+    # --- BM25 tab ---
+    with tab_bm:
+        st.subheader("BM25 Results")
+        if bm25_obj is None:
+            st.error("BM25 index not available. Build BM25 index first.")
+        else:
+            bm_results = search_bm25(query, top_k=top_k)
+            for rank, (fname, score) in enumerate(bm_results, start=1):
+                st.markdown(f"### {rank}. {fname} — score: {score:.4f}")
+                text = load_doc_text(fname)
+                display_text = highlight_query_terms(text, query, max_len=1500) if enable_highlighting else (text[:1500] + ("..." if len(text)>1500 else ""))
+                st.markdown(display_text, unsafe_allow_html=True)
+
+                with st.expander("Document metadata & analysis"):
+                    cat = metadata.get(fname, {}).get("category", "unknown")
+                    st.write(f"**Category:** {category_with_icon(cat)}")
+
+                    # BM25 does not expose per-doc tfidf; show TF-IDF keywords if available
+                    if vectorizer is not None:
+                        kw = tfidf_top_keywords_for_doc(vectorizer, tfidf_matrix, tfidf_filenames, fname, top_n=10)
+                        if kw:
+                            st.write("**Top TF-IDF terms (doc):**")
+                            st.write(", ".join(f"{t} ({s:.3f})" for t,s in kw))
+                    # LDA
+                    if lda_model is not None:
+                        doc_toks = load_doc_text(fname).split()
+                        try:
+                            bow = lda_dictionary.doc2bow(doc_toks)
+                            td = lda_model.get_document_topics(bow)
+                            top_topics = sorted(td, key=lambda x: x[1], reverse=True)[:5]
+                            st.write("**Top topics (LDA)**:")
+                            for tid, prob in top_topics:
+                                st.write(f"Topic {tid} — {prob:.3f}")
+                        except Exception:
+                            st.write("LDA topic info not available for this doc.")
+                st.markdown("---")
+
+    # --- Semantic tab ---
+    with tab_sem:
+        st.subheader("Semantic (FAISS) Results")
+        if faiss_index is None:
+            st.error("FAISS index not available.")
+        else:
+            sem_results = search_faiss(query, top_k=top_k)
+            for rank, (fname, dist) in enumerate(sem_results, start=1):
+                st.markdown(f"### {rank}. {fname} — distance: {dist:.4f}")
+                text = load_doc_text(fname)
+                # For semantic results highlighting we still highlight query terms in preview
+                display_text = highlight_query_terms(text, query, max_len=1500) if enable_highlighting else (text[:1500] + ("..." if len(text)>1500 else ""))
+                st.markdown(display_text, unsafe_allow_html=True)
+
+                with st.expander("Document metadata & analysis"):
+                    cat = metadata.get(fname, {}).get("category", "unknown")
+                    st.write(f"**Category:** {category_with_icon(cat)}")
+
+                    # show tf-idf keywords (if available)
+                    if vectorizer is not None:
+                        kw = tfidf_top_keywords_for_doc(vectorizer, tfidf_matrix, tfidf_filenames, fname, top_n=10)
+                        if kw:
+                            st.write("**Top TF-IDF terms (doc):**")
+                            st.write(", ".join(f"{t} ({s:.3f})" for t,s in kw))
+                    # LDA topics
+                    if lda_model is not None:
+                        doc_toks = load_doc_text(fname).split()
+                        try:
+                            bow = lda_dictionary.doc2bow(doc_toks)
+                            td = lda_model.get_document_topics(bow)
+                            top_topics = sorted(td, key=lambda x: x[1], reverse=True)[:5]
+                            st.write("**Top topics (LDA)**:")
+                            for tid, prob in top_topics:
+                                st.write(f"Topic {tid} — {prob:.3f}")
+                        except Exception:
+                            st.write("LDA topic info not available for this doc.")
+                st.markdown("---")
+
+# If user wants to see LDA viz, attempt to embed HTML
+if show_topic_viz:
+    lda_viz_path = LDA_DIR / "lda_viz.html"
+    if lda_viz_path.exists():
+        st.subheader("LDA Topic Model Visualization")
+        html = lda_viz_path.read_text(encoding="utf-8")
+        components.html(html, height=700)
+    else:
+        st.info("LDA visualization not found. Generate via pyLDAvis (src/topic_modeling/visualize_topics.py)")
 
 #############################################################
-#                UTILITIES FOR SEARCH PAGE
+#                    EVALUATION ENGINE
 #############################################################
 
-def highlight_query_terms(text, query, max_len=500):
-    cleaned_q = clean_text(query)
-    tokens = [t for t in cleaned_q.split() if len(t) > 1]
-    if not tokens:
-        return text[:max_len]
-    pattern = r"\b(" + "|".join(re.escape(t) for t in tokens) + r")\b"
-    return re.sub(pattern, lambda m: f"<mark>{m.group(0)}</mark>", text, flags=re.I)[:max_len]
+if 'run_eval' in locals() and run_eval:
 
+    st.subheader("📊 Evaluation Dashboard (TF-IDF vs BM25 vs Semantic)")
 
-#############################################################
-#                     STREAMLIT LAYOUT
-#############################################################
-
-st.set_page_config(page_title="News IR System", layout="wide")
-
-st.title("📚 News IR Search Engine — TF-IDF | BM25 | Semantic | Evaluation")
-
-# ---- Sidebar ----
-with st.sidebar:
-
-    st.header("Options")
-
-    dark_mode = st.checkbox("🌙 Dark Mode", value=False)
-    apply_theme(dark_mode)
-
-    mode = st.radio(
-        "Select Mode:",
-        ["🔍 Search Engine", "📊 Evaluation Dashboard"]
+    from src.evaluation.evaluate_system import load_qrels
+    from src.evaluation.metrics import (
+        precision_at_k, recall_at_k, mean_average_precision, ndcg_at_k
     )
-
-    st.markdown("---")
-    st.write(f"Documents Loaded: {len(list((DATA_PROCESSED).glob('*.txt')))}")
-
-
-#############################################################
-#                     MODE 1 → SEARCH ENGINE
-#############################################################
-if mode == "🔍 Search Engine":
-
-    st.subheader("Enter your search query:")
-
-    col1, col2 = st.columns([4, 1])
-    with col1:
-        query = st.text_input("Query", placeholder="e.g. economy inflation government crisis")
-    with col2:
-        search_model = st.selectbox("Model", ["TF-IDF", "BM25", "Semantic"])
-
-    top_k = st.slider("Top K", 3, 20, 5)
-    enable_highlight = st.checkbox("Highlight Query Terms", True)
-
-    vectorizer, tfidf_matrix, tfidf_filenames = cached_load_tfidf()
-    bm25_obj = cached_load_bm25()
-    faiss_index, faiss_filenames = cached_load_faiss()
-
-    if st.button("Search"):
-        cleaned_query = clean_text(query)
-
-        results = []
-        if search_model == "TF-IDF":
-            results = search_tfidf(cleaned_query, top_k)
-        elif search_model == "BM25":
-            results = search_bm25(query, top_k)
-        elif search_model == "Semantic":
-            results = search_faiss(query, top_k)
-
-        st.subheader(f"{search_model} Results")
-
-        for rank, (fname, score) in enumerate(results, start=1):
-            st.markdown(f"### {rank}. {fname} — **{score:.4f}**")
-            path = DATA_PROCESSED / fname
-            text = path.read_text(encoding="utf-8")
-            preview = highlight_query_terms(text, query, 1200) if enable_highlight else text[:1200]
-            st.markdown(preview, unsafe_allow_html=True)
-            st.markdown("---")
-
-
-#############################################################
-#                      MODE 2 → EVALUATION
-#############################################################
-else:
-    st.subheader("📊 Retrieval Evaluation Dashboard")
 
     try:
         queries, qrels = load_qrels()
     except:
-        st.error("❌ qrels.csv not found in data/processed/")
+        st.error("❌ qrels.csv not found in data/processed/. Please create it first.")
         st.stop()
 
-    top_k = st.slider("Evaluation Top-K", 5, 20, 10)
+    eval_k = st.slider("Evaluation @K", 5, 20, 10)
 
-    if st.button("Run Evaluation"):
+    st.write("Running evaluation...")
 
-        vectorizer, tfidf_matrix, tfidf_filenames = cached_load_tfidf()
-        bm25_obj = cached_load_bm25()
-        faiss_index, faiss_filenames = cached_load_faiss()
+    # Prepare models
+    vectorizer, tfidf_matrix, tfidf_filenames = cached_load_tfidf()
+    bm25_obj = cached_load_bm25()
+    faiss_index, faiss_filenames = cached_load_faiss()
 
-        all_tf = []
-        all_bm = []
-        all_sem = []
+    all_tf, all_bm, all_sem = [], [], []
 
-        st.write("Running evaluation...")
+    for q in queries:
+        cq = clean_text(q)
 
-        for q in queries:
-            cq = clean_text(q)
+        # TF-IDF
+        tf = search_tfidf(cq, eval_k)
+        all_tf.append([x[0] for x in tf])
 
-            # TF-IDF
-            tf = search_tfidf(cq, top_k)
-            all_tf.append([x[0] for x in tf])
+        # BM25
+        bm = search_bm25(q, eval_k)
+        all_bm.append([x[0] for x in bm])
 
-            # BM25
-            bm = search_bm25(q, top_k)
-            all_bm.append([x[0] for x in bm])
+        # Semantic
+        sem = search_faiss(q, eval_k)
+        all_sem.append([x[0] for x in sem])
 
-            # Semantic
-            sem = search_faiss(q, top_k)
-            all_sem.append([x[0] for x in sem])
+    def metric_row(name, retrieved):
+        return {
+            "Model": name,
+            "MAP": mean_average_precision(qrels, retrieved),
+            "P@K": np.mean([precision_at_k(r, ret, eval_k) for r, ret in zip(qrels, retrieved)]),
+            "R@K": np.mean([recall_at_k(r, ret, eval_k) for r, ret in zip(qrels, retrieved)]),
+            "NDCG@K": np.mean([ndcg_at_k(r, ret, eval_k) for r, ret in zip(qrels, retrieved)]),
+        }
 
-        # ---- Compute Metrics ----
-        def build_metrics(model_name, retrieved):
-            return {
-                "Model": model_name,
-                "MAP": mean_average_precision(qrels, retrieved),
-                "P@K": np.mean([precision_at_k(r, ret, top_k) for r, ret in zip(qrels, retrieved)]),
-                "R@K": np.mean([recall_at_k(r, ret, top_k) for r, ret in zip(qrels, retrieved)]),
-                "NDCG@K": np.mean([ndcg_at_k(r, ret, top_k) for r, ret in zip(qrels, retrieved)]),
-            }
+    table = [
+        metric_row("TF-IDF", all_tf),
+        metric_row("BM25", all_bm),
+        metric_row("Semantic", all_sem),
+    ]
 
-        results_table = [
-            build_metrics("TF-IDF", all_tf),
-            build_metrics("BM25", all_bm),
-            build_metrics("Semantic", all_sem),
-        ]
+    st.success("Evaluation Complete ✓")
+    st.table(table)
 
-        st.success("Evaluation Complete ✓")
+    st.markdown("### Interpretation Guide:")
+    st.write("- **MAP**: Measures ranking quality.")
+    st.write("- **NDCG@K**: Rewards highly ranked relevant docs.")
+    st.write("- **Precision@K**: Percentage of retrieved docs that are correct.")
+    st.write("- **Recall@K**: How many relevant docs are retrieved.")
 
-        st.table(results_table)
 
-        st.markdown("### Interpretation:")
-        st.write("- **MAP** reflects ranking quality.")
-        st.write("- **NDCG** measures ordering of relevant documents.")
-        st.write("- **Precision/Recall** measure retrieval coverage.")
+# Footer tips
+st.sidebar.markdown("---")
+st.sidebar.write("Tip: Use the 'Show LDA topics' checkbox if you generated `data/lda/lda_viz.html`.")
+st.sidebar.write("Tip: To rebuild indices, run scripts from the terminal (TF-IDF, BM25, embeddings).")
+
 
