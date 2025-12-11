@@ -58,6 +58,14 @@ IF %ERRORLEVEL% NEQ 0 (
 )
 
 echo.
+echo Generating QRELS file for evaluation...
+python -m src.evaluation.generate_qrels
+IF %ERRORLEVEL% NEQ 0 (
+    echo ERROR: QRELS generation failed.
+    exit /b
+)
+
+echo.
 echo ====================================
 echo     ALL STEPS COMPLETED SUCCESSFULLY
 echo ====================================

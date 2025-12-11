@@ -3,7 +3,6 @@ import re
 from nltk.corpus import stopwords
 from nltk.stem import WordNetLemmatizer
 
-# Ensure you downloaded NLTK resources:
 # python -c "import nltk; nltk.download('stopwords'); nltk.download('wordnet'); nltk.download('omw-1.4')"
 
 _stopwords = set(stopwords.words("english"))
